@@ -1,71 +1,70 @@
 #!/usr/bin/env python
-# channels_compare_fbcsp.py   2025-06-03
-# ────────────────────────────────────────────────────────────────
-# 复现 Panachakel & Ramakrishnan 2019（short-vs-long）
-# 并比较：
-#   • 60 EEG baseline
-#   • 前 K 对 CSP 滤波器 + DWT-24
-#   • Filter-Bank CSP (4 子带) + TangentSpace + DWT-24
-#   可选 SFFS 物理通道搜索
-# ────────────────────────────────────────────────────────────────
+# channels_compare_fbcsp.py
+# ─────────────────────────────────────────────────────────────
+#  Panachakel & Ramakrishnan 2019 imagined short-vs-long 复现
+#    • 60-channel baseline (DWT-12 ×60)
+#    • 前 K 对 CSP 滤波器 + DWT-24
+#    • 4-band FB-CSP + TangentSpace + DWT-24  （论文配置）
+#    • 可选 SFFS 物理通道挑选
+# ─────────────────────────────────────────────────────────────
 
 import os, warnings, numpy as np, pywt, torch, torch.nn as nn
 from pathlib import Path
 from scipy.io import loadmat
 from scipy.signal import butter, filtfilt, iirnotch
 from mne.decoding import CSP
-from pyriemann.tangentspace import TangentSpace        # ← 0.8 以后
+from pyriemann.tangentspace import TangentSpace
 from pyriemann.estimation  import Covariances
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import accuracy_score
-from tqdm import tqdm
 
-# ────────── 全局开关 ──────────
-USE_FBCSP = True          # True = 论文配置（FB-CSP+TS+DWT），False = 仅 CSP+DWT
-USE_SFFS  = False         # True 时会调用占位的 sffs_dummy()
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-SEED  = 0
-torch.manual_seed(SEED); np.random.seed(SEED)
+# ─────────────── 开关 ────────────────
+USE_FBCSP = True          # 论文配置：FB-CSP + TS + DWT
+USE_SFFS  = False         # 若 True 请实现 run_sffs()
+SEED = 0
+np.random.seed(SEED); torch.manual_seed(SEED)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print("💻  device =", DEVICE)
 
-# ────────── 路径 & 常量 ───────
-DATA_DIR  = Path(__file__).resolve().parent.parent / "data/Short_Long_words"
-EOG_CH    = [0, 9, 32, 63]        # 1,10,33,64
-FS, WIN   = 256, 5*256
-K_LIST    = [0, 1, 3, 5, 7, 9, 11, 15]   # 0 = baseline-60
+# ─────────────── 常量 ────────────────
+BASE      = Path(__file__).resolve().parent.parent
+DATA_DIR  = BASE / "data/Short_Long_words"
+EOG_CH    = [0, 9, 32, 63]                 # 1,10,33,64
+FS, WIN   = 256, 5*256                     # 5 s
+# K_LIST    = [0, 1, 3, 5, 7, 9, 11, 13, 15] # 0=60-ch baseline
+K_LIST = [0] + list(range(1, 31, 1))
 FBANDS    = [(8,12), (12,16), (16,20), (20,24)]
-PAIR_DIM  = 24                 # 12×2  (DWT + 左右 CSP)
+PAIR_DIM_DWT = 24                          # 12 × 2
 
-warnings.filterwarnings("ignore", category=RuntimeWarning)
-
-# ────────── 前处理滤波 ────────
-bp_b, bp_a  = butter(4, [8,70], fs=FS, btype='bandpass')
-nb_b, nb_a  = iirnotch(60, 30, fs=FS)
+# ─────────────── 滤波器 ───────────────
+bp_b, bp_a = butter(4, [8, 70], fs=FS, btype='band')
+nb_b, nb_a = iirnotch(60, 30, fs=FS)
 
 def preprocess(sig60):
     sig = filtfilt(bp_b, bp_a,  sig60, axis=1)
-    sig = filtfilt(nb_b, nb_a, sig,   axis=1)
+    sig = filtfilt(nb_b, nb_a, sig,    axis=1)
     return sig
 
 def bandpass(data, lo, hi):
-    b, a = butter(4, [lo,hi], fs=FS, btype='band')
+    b, a = butter(4, [lo, hi], fs=FS, btype='band')
     return filtfilt(b, a, data, axis=-1)
 
-# ────────── DWT-12 特征 ───────
+# ─────────────── DWT-12 ───────────────
 def dwt12(x):
-    coeffs = pywt.wavedec(x, "db4", level=4)[:4]   # A4 D4 D3 D2
-    out = []
+    coeffs = pywt.wavedec(x, "db4", level=4)[:4]   # A4,D4,D3,D2
+    feat = []
     for arr in coeffs:
         rms  = np.sqrt((arr**2).mean())
         var  = arr.var()
         p    = (arr**2)/(arr**2).sum()
         ent  = -(p*np.log(p+1e-12)).sum()
-        out.extend([rms, var, ent])
-    return np.asarray(out, np.float32)             # (12,)
+        feat.extend([rms, var, ent])
+    return np.asarray(feat, np.float32)            # (12,)
 
-# ────────── DNN 40-40-40-40 ───
+# ─────────────── DNN ────────────────
 class DNN(nn.Module):
     def __init__(self, d_in):
         super().__init__()
@@ -74,90 +73,84 @@ class DNN(nn.Module):
             nn.Linear(40, 40),   nn.ReLU(), nn.BatchNorm1d(40), nn.Dropout(.30),
             nn.Linear(40, 40),   nn.Tanh(), nn.BatchNorm1d(40), nn.Dropout(.30),
             nn.Linear(40, 40),   nn.ReLU(), nn.BatchNorm1d(40), nn.Dropout(.30),
-            nn.Linear(40, 1)
-        )
+            nn.Linear(40, 1))
     def forward(self, x): return self.net(x).squeeze(1)
 
-# ────────── (占位) SFFS ───────
-def sffs_dummy(X60, y):
-    """返回前 15 个物理通道索引，仅作占位示例"""
-    return list(range(15))
+# ─────────────── (占位) SFFS ───────────────
+def run_sffs(X60, y, k=15):
+    """示例：直接返回前 k 个通道；如需真正 SFFS 请自行替换"""
+    return list(range(k))
 
-# ────────── 主流程 ────────────
+# ─────────────── 主流程 ───────────────
 subj_files = sorted([f for f in DATA_DIR.glob("*.mat") if "_8s" not in f.name])
 results = {k: [] for k in K_LIST}
 
 for fmat in subj_files:
     mat = loadmat(fmat, simplify_cells=True)
-    key = [k for k in mat if k.endswith("last_beep")][0]
-    raw = mat[key]                                       # (2,n_trial)
+    key = next(k for k in mat if k.endswith("last_beep"))
+    raw = mat[key]                                   # (2, trials)
 
-    # ---- 预处理、截 5 s、去 EOG ----
-    X_trials, y_trials = [], []
+    # ——预处理——
+    X, y = [], []
     for cls, row in enumerate(raw):
         for ep in row:
-            ep = preprocess(np.delete(ep[:, :WIN], EOG_CH, 0))   # 60×1280
-            X_trials.append(ep); y_trials.append(cls)
-    X_trials = np.stack(X_trials); y_trials = np.asarray(y_trials, np.float32)
+            sig = preprocess(np.delete(ep[:, :WIN], EOG_CH, 0))  # 60×1280
+            X.append(sig); y.append(cls)
+    X = np.stack(X); y = np.asarray(y, float)
 
-    # ---- 类均衡（可选剔除坏试次） ----
-    n0, n1 = (y_trials==0).sum(), (y_trials==1).sum()
+    # ——类均衡——
+    n0, n1 = (y == 0).sum(), (y == 1).sum()
     if n0 != n1:
         n_min = min(n0, n1)
-        idx0  = np.random.choice(np.where(y_trials==0)[0], n_min, replace=False)
-        idx1  = np.random.choice(np.where(y_trials==1)[0], n_min, replace=False)
-        keep  = np.sort(np.hstack([idx0, idx1]))
-        X_trials, y_trials = X_trials[keep], y_trials[keep]
+        keep0 = np.random.choice(np.where(y == 0)[0], n_min, False)
+        keep1 = np.random.choice(np.where(y == 1)[0], n_min, False)
+        keep  = np.sort(np.hstack([keep0, keep1]))
+        X, y  = X[keep], y[keep]
 
-    # ---- SFFS：提前选物理通道（如果启用） ----
+    # ——SFFS（可选）——
     if USE_SFFS:
-        pick_idx = sffs_dummy(X_trials, y_trials)        # user-defined
-        X_trials = X_trials[:, pick_idx]                 # 维度变 (n,len(idx),T)
+        sel = run_sffs(X, y, k=15)   # 返回 ≤15 个通道索引
+        X   = X[:, sel]
 
-    # ==============================================================
-    #                 针对每个 K 构造特征 + 5-fold CV
-    # ==============================================================
-
+    # ========== 逐 K 计算 ==========
     for K in K_LIST:
-        feats_trial = []                # 每个 trial → (pair_num , feat_dim)
-        if K == 0:
-            # ===== baseline：60 EEG × DWT-12 =====
-            pair_dim, pair_num = 12, X_trials.shape[1]
-            for ep in X_trials:
+        feats_trial = []             # per-trial 特征列表
+
+        if K == 0:                   # ——60-ch baseline——
+            pair_dim, pair_num = 12, X.shape[1]
+            for ep in X:
                 feats_trial.append(np.stack([dwt12(ch) for ch in ep]))
 
-        else:
-            # ====== 先求 CSP 滤波器 ======
-            csp = CSP(n_components=2*K, reg='ledoit_wolf',
-                      transform_into='csp_space').fit(X_trials, y_trials)
+        else:                        # ——先取 CSP K 对——
+            csp = CSP(2*K, reg='ledoit_wolf', transform_into='csp_space').fit(X, y)
             Wmax, Wmin = csp.filters_[:K], csp.filters_[-K:]
 
-            if USE_FBCSP:
-                # ——4 子带 Tangent-Space + DWT-24 (同论文)——
-                # ── FB-CSP + TangentSpace + DWT ───────────────────
+            if USE_FBCSP:            # ---- FB-CSP + TS + DWT ----
                 ts_bands = []
                 for lo, hi in FBANDS:
-                    X_fb = bandpass(X_trials, lo, hi)
-                    csp = CSP(n_components=2 * K, reg='ledoit_wolf',
-                              transform_into='csp_space').fit(X_fb, y_trials)
-                    Wmax, Wmin = csp.filters_[:K], csp.filters_[-K:]
-                    covs = Covariances(estimator='oas').transform(
-                        np.tensordot(Wmax, X_fb, axes=(1, 1)).transpose(1, 0, 2))
-                    ts_bands.append(TangentSpace().fit_transform(covs).astype(np.float32))
+                    Xfb = bandpass(X, lo, hi)
+                    csp_fb = CSP(2*K, reg='ledoit_wolf',
+                                  transform_into='csp_space').fit(Xfb, y)
+                    covs   = Covariances(estimator='oas').transform(
+                             np.tensordot(csp_fb.filters_[:K], Xfb, axes=(1,1))
+                             .transpose(1,0,2))
+                    ts_bands.append(TangentSpace().fit_transform(covs))
 
-                pair_dim = ts_bands[0].shape[1] + 24 * K  # ← 乘 K!!
-                pair_num = 1  # 每 trial 合成 1 向量
-                for t, ep in enumerate(X_trials):
+                ts_dim   = ts_bands[0].shape[1]
+                pair_dim = ts_dim*len(FBANDS) + 24*K
+                pair_num = 1
+
+                for t, ep in enumerate(X):
                     dwt_pairs = []
                     for i in range(K):
-                        a, b = Wmax[i] @ ep, Wmin[i] @ ep
+                        a, b = Wmax[i]@ep, Wmin[i]@ep
                         dwt_pairs.append(np.hstack([dwt12(a), dwt12(b)]))
-                    feats_trial.append(np.hstack([band[t] for band in ts_bands] + dwt_pairs))
+                    feats_trial.append(
+                        np.hstack([band[t] for band in ts_bands] + dwt_pairs))
 
-            else:
-                # ——只用 DWT-24，pair_num = K——
+            else:                    # ---- 仅 CSP + DWT-24 ----
                 pair_dim, pair_num = 24, K
-                for ep in X_trials:
+                for ep in X:
                     pairs=[]
                     for i in range(K):
                         a,b = Wmax[i]@ep, Wmin[i]@ep
@@ -165,60 +158,54 @@ for fmat in subj_files:
                         pairs.append((vec-vec.mean())/(vec.std()+1e-6))
                     feats_trial.append(np.stack(pairs))
 
-        # -- 转 ndarray，安全检查 --
-        feats_trial = np.asarray(feats_trial)
+        feats_trial = np.asarray(feats_trial)         # (n, pair_num, pair_dim)
+        if feats_trial.ndim == 2:                     # baseline 情况
+            feats_trial = feats_trial[:, None, :]
+            pair_num    = 1
+            pair_dim    = feats_trial.shape[-1]
 
-        # ---- 自适应补维度 ----
-        if feats_trial.ndim == 2:  # shape = (n_trial, pair_dim)
-            pair_num = 1
-            pair_dim = feats_trial.shape[1]
-            feats_trial = feats_trial[:, None, :]  # → (n_trial, 1, pair_dim)
-        else:  # shape = (n_trial, pair_num, pair_dim)
-            pair_dim = feats_trial.shape[2]  # 保持原定义
-
-        # ============ 5-fold CV ============
+        # --------------- 5-fold CV ---------------
         cv = StratifiedKFold(5, shuffle=True, random_state=SEED)
-        fold_acc=[]
-        for tr, te in cv.split(np.arange(len(feats_trial)), y_trials):
-            # flatten train
-            X_tr = feats_trial[tr].reshape(len(tr)*pair_num, pair_dim)
-            y_tr = np.repeat(y_trials[tr], pair_num)
-            X_tr = torch.tensor(X_tr, device=DEVICE)
-            y_tr = torch.tensor(y_tr, dtype=torch.float32, device=DEVICE)
+        acc_fold = []
+        for tr, te in cv.split(np.arange(len(feats_trial)), y):
+            Xtr = torch.tensor(feats_trial[tr].reshape(-1, pair_dim),
+                               dtype=torch.float32, device=DEVICE)
+            ytr = torch.tensor(np.repeat(y[tr], pair_num),
+                               dtype=torch.float32, device=DEVICE)
 
-            # flatten test & 记录分段
-            X_te = feats_trial[te].reshape(len(te)*pair_num, pair_dim)
-            X_te = torch.tensor(X_te, device=DEVICE)
+            Xte = torch.tensor(feats_trial[te].reshape(-1, pair_dim),
+                               dtype=torch.float32, device=DEVICE)
             split_te = [pair_num]*len(te)
 
-            net = DNN(pair_dim).to(DEVICE)
-            opt = torch.optim.Adam(net.parameters(), 1e-3, weight_decay=1e-4)
-            lossf = nn.BCEWithLogitsLoss()
+            net  = DNN(pair_dim).to(DEVICE)
+            opt  = torch.optim.Adam(net.parameters(), 1e-3, weight_decay=1e-4)
+            loss = nn.BCEWithLogitsLoss()
 
             for _ in range(50):
                 net.train()
-                perm = torch.randperm(len(X_tr), device=DEVICE)
+                perm = torch.randperm(len(Xtr), device=DEVICE)
                 for beg in range(0, len(perm), 512):
                     idx = perm[beg:beg+512]
                     opt.zero_grad()
-                    lossf(net(X_tr[idx]), y_tr[idx]).backward()
+                    loss(net(Xtr[idx]), ytr[idx]).backward()
                     opt.step()
 
-            # ---- test ----
             net.eval()
             with torch.no_grad():
-                prob = torch.sigmoid(net(X_te)).cpu().numpy()
+                prob = torch.sigmoid(net(Xte)).cpu().numpy()
+
             pred, cur = [], 0
             for n in split_te:
-                pred.append(int(prob[cur:cur+n].mean() > .5)); cur += n
-            fold_acc.append(accuracy_score(y_trials[te], pred))
+                pred.append(int(prob[cur:cur+n].mean() > 0.5)); cur += n
+            acc_fold.append(accuracy_score(y[te], pred))
 
-        results[K].append(np.mean(fold_acc))
+        results[K].append(np.mean(acc_fold))
     print("✔", fmat.name)
 
-# ────────── 打印总表 ──────────
+# ─────────────── 汇总输出 ───────────────
 print("\nElectrodes |  acc_mean ± std")
 print("-----------------------------")
 for k in K_LIST:
-    tag = "60 (all)" if k==0 else f"{k*2}  "
-    print(f"{tag:>10} |  {np.mean(results[k]):.3f} ± {np.std(results[k]):.3f}")
+    tag = "60 (all)" if k == 0 else str(k*2).rjust(2)
+    m, s = np.mean(results[k]), np.std(results[k])
+    print(f"{tag:>10} |  {m:.3f} ± {s:.3f}")
