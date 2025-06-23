@@ -111,8 +111,18 @@ def get_channel_importance(baseline, X_trials, y_trials,
     """
     # 1) 把 trial → classifier_fn 需要的形状
     def classifier_fn(batch):
-        # batch shape: (N, C, T)  →  (N,1,C,T)
-        tensor = torch.tensor(batch[:,None,:,:], dtype=torch.float32, device=DEVICE)
+        # batch: [N, C, T_full]
+        C, T_full = batch.shape[1], batch.shape[2]
+
+        if T_full > WIN:  # 截取中心窗口
+            st = (T_full - WIN) // 2
+            batch = batch[:, :, st:st + WIN]
+        elif T_full < WIN:  # 右侧 0-padding
+            pad = np.zeros((batch.shape[0], C, WIN - T_full), dtype=batch.dtype)
+            batch = np.concatenate([batch, pad], axis=2)
+
+        tensor = torch.tensor(batch[:, None, :, :],
+                              dtype=torch.float32, device=DEVICE)
         with torch.no_grad():
             prob = torch.softmax(baseline(tensor), dim=1)
         return prob.cpu().numpy()
@@ -195,10 +205,10 @@ def main(k_top, num_samples):
 # ---------------- CLI ----------------
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
-    p = argparse.ArgumentParser()
-    p.add_argument("--k", type=int, default=16,
-                   help="保留 Top-K 通道 (默认 16)")
-    p.add_argument("--n_samples", type=int, default=1000,
-                   help="随机扰动样本数 (默认 1000)")
-    args = p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--k", type=int, default=16,
+                        help="保留 Top-K 通道 (默认 16)")
+    parser.add_argument("--n_samples", type=int, default=1000,
+                        help="随机扰动样本数 (默认 1000)")
+    args = parser.parse_args()
     main(args.k, args.n_samples)
