@@ -14,7 +14,7 @@ from sklearn.model_selection import GroupKFold
 from tqdm import trange
 
 # ======== 你的网络和旧脚本里用到的函数 ========
-from check import EEGNet                        # 如果类在别处改 import
+from eegnet_model import EEGNet
 from neuroxai.explanation import BrainExplainer, GlobalBrainExplainer
 
 # ---------------- 全局超参 ----------------
