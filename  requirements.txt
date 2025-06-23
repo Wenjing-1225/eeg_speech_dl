@@ -7,3 +7,4 @@ mne
 pyriemann
 PyWavelets
 pywt-data   # PyWavelets 的测试数据；可省
+lime tqdm
