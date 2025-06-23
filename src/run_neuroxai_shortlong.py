@@ -159,11 +159,15 @@ def main(k_top, n_samples):
         ckpt.parent.mkdir(exist_ok=True); torch.save(baseline.state_dict(), ckpt)
 
     # -------- Baseline-60 CV --------
+    # ② Baseline-60 10-fold 评估 …
     print("② Baseline-60 10-fold 评估 …")
-    acc_base=[]
+    acc_base = []
     gkf = GroupKFold(10)
-    for _, te in gkf.split(X_torch, y_torch, groups=g_arr):
-        acc_base.append(evaluate(baseline, X_torch[te], y_arr[te], g_arr[te]))
+    for tr, te in gkf.split(X_torch, y_torch, groups=g_arr):
+        # ① 每个 fold 都重新训练 60 通道网络
+        net_b = train_eegnet(X_torch[tr], y_torch[tr], 60, lr=1e-3)
+        acc_base.append(evaluate(net_b,
+                                 X_torch[te], y_arr[te], g_arr[te]))
     print(f"✔ 60-通道准确率: {np.mean(acc_base):.3f} ± {np.std(acc_base):.3f}")
 
     # -------- NeuroXAI 通道 --------
