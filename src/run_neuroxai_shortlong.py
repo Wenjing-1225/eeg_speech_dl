@@ -106,18 +106,13 @@ def evaluate(net, X, y, g):
 # ---------------- 用 LIME-版 NeuroXAI 得权重 ----------------
 def get_channel_importance(baseline, X_trials, y_trials,
                            num_samples=1000, replacement='mean'):
-    """
-    返回 ndarray (C,) —— 每个通道的全局重要性
-    """
-    # 1) 把 trial → classifier_fn 需要的形状
-    def classifier_fn(batch):
-        # batch: [N, C, T_full]
-        C, T_full = batch.shape[1], batch.shape[2]
 
-        if T_full > WIN:  # 截取中心窗口
+    def classifier_fn(batch):
+        C, T_full = batch.shape[1], batch.shape[2]
+        if T_full > WIN:
             st = (T_full - WIN) // 2
             batch = batch[:, :, st:st + WIN]
-        elif T_full < WIN:  # 右侧 0-padding
+        elif T_full < WIN:
             pad = np.zeros((batch.shape[0], C, WIN - T_full), dtype=batch.dtype)
             batch = np.concatenate([batch, pad], axis=2)
 
@@ -127,11 +122,9 @@ def get_channel_importance(baseline, X_trials, y_trials,
             prob = torch.softmax(baseline(tensor), dim=1)
         return prob.cpu().numpy()
 
-    # 2) LIME 的单样本解释器
-    brain_exp  = BrainExplainer(kernel_width=25, class_names=['short','long'])
+    brain_exp  = BrainExplainer(kernel_width=25, class_names=['short', 'long'])
     global_exp = GlobalBrainExplainer(brain_exp)
 
-    # 3) 逐 trial 做解释（作者源码里会自动 Session-Selector）
     global_exp.explain_instance(
         x=X_trials, y=y_trials,
         classifier_fn=classifier_fn,
@@ -140,8 +133,10 @@ def get_channel_importance(baseline, X_trials, y_trials,
     )
 
     imp_dict = global_exp.explain_global_channel_importance()
-    # 保证顺序和 CHAN_NAMES 对齐
-    return np.array([imp_dict[ch] for ch in CHAN_NAMES], dtype=np.float32)
+    # ------- 关键改动：按索引顺序构造 ndarray -------
+    C = len(CHAN_NAMES)
+    imp = np.array([imp_dict.get(i, 0.0) for i in range(C)], dtype=np.float32)
+    return imp
 
 # ---------------- 主入口 ----------------
 def main(k_top, num_samples):
