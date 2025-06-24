@@ -13,7 +13,8 @@ from scipy.signal import butter, filtfilt, iirnotch
 from sklearn.model_selection import GroupKFold
 from tqdm import trange
 
-from eegnet_model import EEGNet
+# from eegnet_model import EEGNet
+from resnet_eeg import ResNetEEG as EEGNet
 from neuroxai.explanation import BrainExplainer, GlobalBrainExplainer
 
 # ---------------- 全局超参 ----------------
@@ -21,7 +22,7 @@ SEED   = 0
 FS     = 256
 WIN_S  = 2.0; WIN  = int(WIN_S * FS)   # 512
 STEP_S = 0.5; STEP = int(STEP_S * FS)
-EPOCHS = 150
+EPOCHS = 300
 BATCH  = 128
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 np.random.seed(SEED); torch.manual_seed(SEED)
