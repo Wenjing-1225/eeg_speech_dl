@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# run_neuroxai_shortlong.py  ——  EEGNet + 提升 Baseline 准确率的完整流程
+# run_neuroxai_shortlong.py —— Filter-Bank EEGNet + NeuroXAI
 import argparse, json, warnings
 from pathlib import Path
 import numpy as np, torch, torch.nn as nn
@@ -8,15 +8,16 @@ from scipy.signal import butter, filtfilt, iirnotch
 from sklearn.model_selection import GroupKFold
 from tqdm import trange
 
-from eegnet_model import EEGNet                        # ← 切回 EEGNet
+from eegnet_model import EEGNet
 from neuroxai.explanation import BrainExplainer, GlobalBrainExplainer
 
-# ---------------- 超参 ----------------
+# ---------------- 基本参数 ----------------
 SEED = 0
-FS = 256
-WIN_S = 2.0; WIN = int(WIN_S * FS)          # 512
-STEP_S = 0.25; STEP = int(STEP_S * FS)      # 滑窗更密
-EPOCHS = 400                                # 训练更久
+FS   = 256
+WIN_S = 3.0; WIN  = int(WIN_S * FS)   # 3-s 窗口
+STEP_S = 0.25; STEP = int(STEP_S * FS)
+BANDS  = [(4, 7), (8, 13), (14, 30)]  # θ / α / β
+EPOCHS = 400
 BATCH  = 128
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 np.random.seed(SEED); torch.manual_seed(SEED)
@@ -25,23 +26,24 @@ ROOT  = Path(__file__).resolve().parent.parent
 DATA  = ROOT / "data/Short_Long_words"
 FILES = sorted(f for f in DATA.glob("*.mat") if "_8s" not in f.name)
 
-CHAN_NAMES = [  # 省略，保持不变 …
- 'Fp1','Fpz','Fp2','AF7','AF3','AFz','AF4','AF8','F7','F5','F3','F1','Fz','F2',
- 'F4','F6','F8','FT7','FC5','FC3','FC1','FCz','FC2','FC4','FC6','FT8','T7','C5',
- 'C3','C1','Cz','C2','C4','C6','T8','TP7','CP5','CP3','CP1','CPz','CP2','CP4',
- 'CP6','TP8','P7','P5','P3','P1','Pz','P2','P4','P6','P8','PO7','PO3','POz',
- 'PO4','PO8','O1','Oz','O2'
-]
+# 60-通道名称 (删 0,9,32,63)
+CHAN_NAMES = [...]
+N_CH  = len(CHAN_NAMES)          # 60
+N_BAND = len(BANDS)              # 3
+C_ALL = N_CH * N_BAND            # 180
 
-# ---------------- 预处理 ----------------
-bp_b, bp_a = butter(4, [8, 30], fs=FS, btype='band')   # 聚焦 8-30 Hz
+# ---------------- 预处理：Filter-Bank ----------------
 nt_b, nt_a = iirnotch(60, 30, fs=FS)
-def preprocess(sig):
-    sig = filtfilt(nt_b, nt_a, sig, axis=1)
-    sig = filtfilt(bp_b, bp_a, sig, axis=1)
-    sig -= sig.mean(axis=1, keepdims=True)
-    sig /= sig.std(axis=1, keepdims=True) + 1e-6
-    return sig.astype(np.float32)
+def preprocess_fb(sig):
+    """输入 (C,T)-> 输出 (3C,T)"""
+    band_sig = []
+    for low, high in BANDS:
+        b, a = butter(4, [low, high], fs=FS, btype='band')
+        tmp  = filtfilt(b, a, sig, axis=1)
+        tmp -= tmp.mean(axis=1, keepdims=True)
+        tmp /= tmp.std(axis=1, keepdims=True) + 1e-6
+        band_sig.append(tmp)
+    return np.concatenate(band_sig, axis=0).astype(np.float32)
 
 def slide(sig):
     wins=[]
@@ -49,7 +51,7 @@ def slide(sig):
         wins.append(sig[:, st:st+WIN])
     return np.stack(wins)
 
-# ---------------- 数据加载 ----------------
+# ---------------- 读数据 ----------------
 def load_trials():
     trials, labels = [], []
     for f in FILES:
@@ -57,7 +59,7 @@ def load_trials():
         key = next(k for k in mat if k.endswith("last_beep"))
         for cls, tset in enumerate(mat[key]):
             for tr in tset:
-                sig = preprocess(np.delete(tr, [0,9,32,63], axis=0))
+                sig = preprocess_fb(np.delete(tr, [0,9,32,63], axis=0))
                 trials.append(sig); labels.append(cls)
     trials, labels = np.asarray(trials), np.asarray(labels)
     i0,i1 = np.where(labels==0)[0], np.where(labels==1)[0]
@@ -76,141 +78,130 @@ def train_eegnet(X, y, C, lr=1e-3, epochs=EPOCHS):
         perm = torch.randperm(len(X), device=DEVICE)
         for beg in range(0, len(perm), BATCH):
             sl = perm[beg:beg+BATCH]
-            Xb = X[sl] * (1 + 0.01 * torch.randn_like(X[sl]))   # 1 % 噪声增广
-            opt.zero_grad()
-            loss = lossf(net(Xb), y[sl]); loss.backward(); opt.step()
+            Xb = X[sl]*(1+0.01*torch.randn_like(X[sl]))
+            opt.zero_grad(); loss = lossf(net(Xb), y[sl])
+            loss.backward(); opt.step()
         sched.step()
     return net
 
 def evaluate(net, X, y, g):
-    net.eval(); pred=[]
+    net.eval(); preds=[]
     with torch.no_grad():
         for beg in range(0,len(X),BATCH):
-            pred.append(net(X[beg:beg+BATCH]).argmax(1).cpu())
-    pred=np.concatenate(pred)
-    vote={}
-    for p,id in zip(pred,g): vote.setdefault(id,[]).append(p)
-    pred_trial={id:max(set(v), key=v.count) for id,v in vote.items()}
-    true_trial={id:int(y[np.where(g==id)[0][0]]) for id in pred_trial}
+            preds.append(net(X[beg:beg+BATCH]).argmax(1).cpu())
+    preds=np.concatenate(preds); vote={}
+    for p,i in zip(preds,g): vote.setdefault(i,[]).append(p)
+    pred_trial={i:max(set(v), key=v.count) for i,v in vote.items()}
+    true_trial={i:int(y[np.where(g==i)[0][0]]) for i in pred_trial}
     return np.mean([pred_trial[k]==true_trial[k] for k in pred_trial])
 
-# ---------------- NeuroXAI（保持不变） ----------------
-def get_channel_importance(baseline, X_trials, y_trials, num_samples):
-    def classifier_fn(batch):
+# ---------------- NeuroXAI 权重 ----------------
+def get_channel_imp(baseline, X_trials, y_trials, n_samples):
+    def clf_fn(batch):
         C,T = batch.shape[1], batch.shape[2]
-        if T>WIN:
-            st=(T-WIN)//2; batch=batch[:,:,st:st+WIN]
+        if T>WIN: st=(T-WIN)//2; batch=batch[:,:,st:st+WIN]
         elif T<WIN:
             pad=np.zeros((batch.shape[0],C,WIN-T),dtype=batch.dtype)
-            batch=np.concatenate([batch,pad],axis=2)
+            batch=np.concatenate([batch,pad],2)
         tensor=torch.tensor(batch[:,None,:,:],device=DEVICE)
-        with torch.no_grad():
-            prob=torch.softmax(baseline(tensor),1)
-        return prob.cpu().numpy()
+        return torch.softmax(baseline(tensor),1).cpu().numpy()
 
     brain = BrainExplainer(kernel_width=25,class_names=['short','long'])
-    global_exp = GlobalBrainExplainer(brain)
-    global_exp.explain_instance(X_trials,y_trials,classifier_fn,
-                                num_samples=num_samples)
-    imp_d = global_exp.explain_global_channel_importance()
-    return np.array([imp_d.get(i,0.0) for i in range(len(CHAN_NAMES))],
-                    dtype=np.float32)
+    global_exp=GlobalBrainExplainer(brain)
+    global_exp.explain_instance(X_trials,y_trials,clf_fn,n_samples)
+    imp_raw = np.array(
+        [global_exp.explain_global_channel_importance().get(i,0.0)
+         for i in range(C_ALL)],
+        dtype=np.float32
+    )
+    # 把 3 个频带对同一电极的权重做平均 → 60 维
+    imp = np.mean(imp_raw.reshape(N_BAND, N_CH), axis=0)
+    return imp
 
 # ---------------- 主流程 ----------------
 def main(k_top, n_samples):
-    print("① 读取并窗口化数据 …")
+    print("① 读取并窗口化 …")
     trials, labels = load_trials()
 
-    X_win,y_win,g_win=[],[],[]
-    gid=0
+    X_win,y_win,g_win, gid = [],[],[],0
     for sig,lab in zip(trials,labels):
         wins=slide(sig)
-        X_win.append(wins)
-        y_win.extend([lab]*len(wins))
+        X_win.append(wins); y_win.extend([lab]*len(wins))
         g_win.extend([gid]*len(wins)); gid+=1
     X_win=np.concatenate(X_win)
     y_arr=np.asarray(y_win); g_arr=np.asarray(g_win)
-    X_t=torch.tensor(X_win[:,None,:,:],device=DEVICE)
-    y_t=torch.tensor(y_arr,device=DEVICE)
+    X_t  = torch.tensor(X_win[:,None,:,:],device=DEVICE)
+    y_t  = torch.tensor(y_arr, device=DEVICE)
 
-    # -------- 训练 / 载入 EEGNet-60 --------
-    ckpt = ROOT/"results/eegnet_60ch.pt"
-    retrain = not ckpt.exists()
-    baseline = EEGNet(60, WIN).to(DEVICE)
-    if not retrain:
-        try:
-            baseline.load_state_dict(torch.load(ckpt, map_location=DEVICE))
-            print("✔ 已加载 EEGNet-60ch ckpt")
-        except RuntimeError:
-            retrain = True
-    if retrain:
-        print("⏳ 训练 EEGNet-60ch 基线 …")
-        baseline = train_eegnet(X_t, y_t, 60)
+    # -------- 训练 / 载入 180-ch 基线 --------
+    ckpt = ROOT/"results/eegnet_fb_60.pt"
+    baseline = EEGNet(C_ALL, WIN).to(DEVICE)
+    if ckpt.exists():
+        baseline.load_state_dict(torch.load(ckpt,map_location=DEVICE))
+        print("✔ 已加载 ckpt")
+    else:
+        print("⏳ 训练基线 …")
+        baseline = train_eegnet(X_t, y_t, C_ALL)
         ckpt.parent.mkdir(exist_ok=True)
         torch.save(baseline.state_dict(), ckpt)
-        print("✔ 新 ckpt 保存:", ckpt)
 
-    # -------- Baseline-60 CV --------
-    print("② Baseline-60 10-fold 评估 …")
-    gkf = GroupKFold(10); acc_base=[]
+    # -------- Baseline CV --------
+    print("② Baseline-60 CV …")
+    gkf=GroupKFold(10); acc_base=[]
     for tr,te in gkf.split(X_t,y_t,groups=g_arr):
-        net=train_eegnet(X_t[tr],y_t[tr],60,epochs=EPOCHS//2)
+        net=train_eegnet(X_t[tr],y_t[tr],C_ALL,epochs=EPOCHS//2)
         acc_base.append(evaluate(net,X_t[te],y_arr[te],g_arr[te]))
     print(f"✔ 60-ch: {np.mean(acc_base):.3f} ± {np.std(acc_base):.3f}")
 
-    # -------- NeuroXAI --------
+    # -------- NeuroXAI 权重 --------
     print("③ 计算 NeuroXAI 权重 …")
-    imp=get_channel_importance(baseline,trials,labels,n_samples)
-    sel_idx=np.argsort(-imp)[:k_top]
-    sel_names=[CHAN_NAMES[i] for i in sel_idx]
-    print(f"✔ Top-{k_top} 通道:", sel_names)
+    imp = get_channel_imp(baseline,trials,labels,n_samples)
+    sel_base = np.argsort(-imp)[:k_top]        # 选电极索引 (0-59)
+    sel_names= [CHAN_NAMES[i] for i in sel_base]
+    print("✔ Top-{}: {}".format(k_top, sel_names))
+
+    # 把每个电极在 3 个频带的通道索引全部收集
+    def expand(idx): return np.concatenate([idx, idx+N_CH, idx+2*N_CH])
+    sel_idx = expand(sel_base)
+    rand_base = np.random.choice(N_CH, k_top, replace=False)
+    rand_idx  = expand(rand_base)
 
     # -------- NeuroXAI-K CV --------
-    print("④ NeuroXAI-Top-K 10-fold …")
+    print("④ NeuroXAI-Top-K CV …")
     X_sel=torch.tensor(X_win[:,sel_idx][:,None,:,:],device=DEVICE)
     acc_neuro=[]
     for tr,te in gkf.split(X_sel,y_t,groups=g_arr):
-        net=train_eegnet(X_sel[tr],y_t[tr],k_top,epochs=EPOCHS//2)
+        net=train_eegnet(X_sel[tr],y_t[tr], len(sel_idx), epochs=EPOCHS//2)
         acc_neuro.append(evaluate(net,X_sel[te],y_arr[te],g_arr[te]))
     print(f"✔ NeuroXAI-{k_top}: {np.mean(acc_neuro):.3f} ± {np.std(acc_neuro):.3f}")
 
     # -------- Random-K CV --------
-    print("⑤ Random-Top-K 10-fold …")
-    np.random.seed(42)
-    rand_idx = np.random.choice(60, k_top, replace=False)
-    X_rand = torch.tensor(X_win[:, rand_idx][:, None, :, :], device=DEVICE)
-
-    acc_rand = []
-    for tr, te in gkf.split(X_rand, y_t, groups=g_arr):
-        net_r = train_eegnet(X_rand[tr], y_t[tr], k_top, epochs=EPOCHS // 2)
-        acc_rand.append(evaluate(net_r, X_rand[te], y_arr[te], g_arr[te]))
+    print("⑤ Random-Top-K CV …")
+    X_rand=torch.tensor(X_win[:,rand_idx][:,None,:,:],device=DEVICE)
+    acc_rand=[]
+    for tr,te in gkf.split(X_rand,y_t,groups=g_arr):
+        net=train_eegnet(X_rand[tr],y_t[tr],len(rand_idx),epochs=EPOCHS//2)
+        acc_rand.append(evaluate(net,X_rand[te],y_arr[te],g_arr[te]))
     print(f"✔ Random-{k_top}: {np.mean(acc_rand):.3f} ± {np.std(acc_rand):.3f}")
 
-    # -------- 保存结果 --------
-    out = ROOT / f"results/eegnet_neuroxai_vs_random_top{k_top}.json"
-    out.parent.mkdir(exist_ok=True)
-    json.dump(
-        {
-            "k": k_top,
-            "idx_neuro": sel_idx.tolist(),
-            "names_neuro": sel_names,
-            "acc_base": [float(np.mean(acc_base)), float(np.std(acc_base))],
-            "acc_neuro": [float(np.mean(acc_neuro)), float(np.std(acc_neuro))],
-            "acc_rand": [float(np.mean(acc_rand)), float(np.std(acc_rand))]
-        },
-        open(out, "w"),
-        indent=2
-    )
-    print("✔ 结果已存到", out)
+    # -------- 保存 --------
+    out = ROOT/f"results/FB_eegnet_vs_random_top{k_top}.json"
+    json.dump({
+        "k":k_top,
+        "names_neuro":sel_names,
+        "acc_base":[float(np.mean(acc_base)),float(np.std(acc_base))],
+        "acc_neuro":[float(np.mean(acc_neuro)),float(np.std(acc_neuro))],
+        "acc_rand":[float(np.mean(acc_rand)),float(np.std(acc_rand))]
+    }, open(out,"w"), indent=2)
+    print("✔ Results saved to", out)
 
 
 # ---------------- CLI ----------------
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--k", type=int, default=16,
-                        help="保留 Top-K 通道 (默认 16)")
-    parser.add_argument("--n_samples", type=int, default=3000,
-                        help="NeuroXAI 随机扰动样本数 (默认 3000)")
-    args = parser.parse_args()
-    main(args.k, args.n_samples)
+    p = argparse.ArgumentParser()
+    p.add_argument("--k", type=int, default=16,
+                   help="保留 Top-K 电极 (默认 16)")
+    p.add_argument("--n_samples", type=int, default=3000,
+                   help="NeuroXAI 扰动样本数")
+    args = p.parse_args(); main(args.k, args.n_samples)
