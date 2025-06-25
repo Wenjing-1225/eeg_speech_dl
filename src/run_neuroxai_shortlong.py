@@ -174,18 +174,42 @@ def eval_eegnet(net, X, y_np, g_np):
                     for i in trial_pred])
 
 # ---------- NeuroXAI ----------
+# ---------- NeuroXAI 计算权重 ----------
 def neuroxai_importance(baseline, trials, labels, n_samples):
-    def clf(batch):
-        # batch : (N,C,T)  → (N,1,C,T)
-        batch = torch.tensor(batch[:,None,:,:], dtype=torch.float32, device=DEVICE)
-        with torch.no_grad(): out = baseline(batch)
-        return torch.softmax(out,1).cpu().numpy()
+    """
+    baseline : 已训练好的全通道 EEGNet
+    trials   : (n_trial, C, T_full)
+    """
+    def clf(batch_np):
+        """NeuroXAI 要求的 classifier_fn —— 先对齐到 WIN 再推理"""
+        # batch_np : (B, C, T_full)
+        C, T_full = batch_np.shape[1], batch_np.shape[2]
 
-    brain=BrainExplainer(25,['short','long'])
-    gexp = GlobalBrainExplainer(brain)
-    gexp.explain_instance(trials, labels, clf, num_samples=n_samples)
-    imp=[gexp.explain_global_channel_importance().get(i,0.0) for i in range(N_CH)]
-    return np.asarray(imp)
+        # ① 裁剪 / 补零到 WIN (=512 sample)
+        if T_full > WIN:                        # 裁中间一段
+            st = (T_full - WIN) // 2
+            batch_np = batch_np[:, :, st:st+WIN]
+        elif T_full < WIN:                      # 尾部补 0
+            pad = np.zeros((batch_np.shape[0], C, WIN-T_full),
+                           dtype=batch_np.dtype)
+            batch_np = np.concatenate([batch_np, pad], axis=2)
+
+        # ② (B,1,C,T) → baseline
+        tensor = torch.tensor(batch_np[:, None, :, :],
+                              dtype=torch.float32, device=DEVICE)
+        with torch.no_grad():
+            out = baseline(tensor)              # (B,2)
+        return torch.softmax(out, dim=1).cpu().numpy()
+
+    # ======== 调用 NeuroXAI ========
+    brain = BrainExplainer(kernel_width=25, class_names=['short','long'])
+    gexp  = GlobalBrainExplainer(brain)
+    gexp.explain_instance(trials, labels, clf,
+                          num_samples=n_samples)
+
+    imp = [gexp.explain_global_channel_importance().get(i, 0.0)
+           for i in range(N_CH)]
+    return np.asarray(imp, dtype=np.float32)
 
 # ---------- 主入口 ----------
 def main(k_list, n_samples):
