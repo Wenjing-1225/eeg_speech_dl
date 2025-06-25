@@ -108,33 +108,43 @@ def apply_global_ica(trials, n_comp=None):
     return np.asarray(transformed)     # (N_trial, C, T)
 
 # ---------- EEGNet 动态 fc ----------
+# ---------- EEGNet (auto‐shape) ----------
 class EEGNet(nn.Module):
-    def __init__(self, C, T, n_cls=2):
+    def __init__(self, C:int, T:int, n_cls:int = 2):
         super().__init__()
-        self.conv1 = nn.Conv2d(1,  8, (1,64), padding=(0,32), bias=False)
+        # ----- block-1 -----
+        self.conv1 = nn.Conv2d(1, 8, (1, 64), padding=(0, 32), bias=False)
         self.bn1   = nn.BatchNorm2d(8)
-        self.conv2 = nn.Conv2d(8, 16, (C,1), groups=8, bias=False)
+
+        # ----- block-2 -----
+        self.conv2 = nn.Conv2d(8, 16, (C, 1), groups=8, bias=False)
         self.bn2   = nn.BatchNorm2d(16)
-        self.pool2 = nn.AvgPool2d((1,4)); self.drop2 = nn.Dropout(.25)
-        self.conv3 = nn.Conv2d(16,16, (1,16), padding=(0,8), bias=False)
+        self.pool2 = nn.AvgPool2d((1, 4))
+        self.drop2 = nn.Dropout(0.25)
+
+        # ----- block-3 -----
+        self.conv3 = nn.Conv2d(16, 16, (1, 16), padding=(0, 8), bias=False)
         self.bn3   = nn.BatchNorm2d(16)
-        self.pool3 = nn.AvgPool2d((1,8)); self.drop3 = nn.Dropout(.25)
-        # --- 动态计算 fc 输入维度 ---
+        self.pool3 = nn.AvgPool2d((1, 8))
+        self.drop3 = nn.Dropout(0.25)
+
+        # ----- 自动计算展平维度 -----
         with torch.no_grad():
-            dummy = torch.zeros(1,1,C,T)
+            dummy = torch.zeros(1, 1, C, T)      # (B,1,C,T)
             feat  = self._forward_features(dummy)
-            in_dim = feat.shape[1]
+            in_dim = feat.shape[1]               # = 640 in 你当前设置
         self.fc = nn.Linear(in_dim, n_cls)
 
-    def _forward_features(self,x):
+    # 把卷积流程抽成私有函数
+    def _forward_features(self, x: torch.Tensor) -> torch.Tensor:
         x = torch.relu(self.bn1(self.conv1(x)))
         x = torch.relu(self.bn2(self.conv2(x)))
         x = self.pool2(x); x = self.drop2(x)
         x = torch.relu(self.bn3(self.conv3(x)))
         x = self.pool3(x); x = self.drop3(x)
-        return x.flatten(1)
+        return x.flatten(1)                      # (B, feat)
 
-    def forward(self,x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self._forward_features(x)
         return self.fc(x)
 
