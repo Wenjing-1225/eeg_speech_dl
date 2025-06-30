@@ -13,7 +13,7 @@ Pipeline: 60-ch Baseline → (可选) NeuroXAI 选通道 → Top-K 评估
       • NeuroXAI 最终 Top-16 通道 (acc16)
    与 60-ch baseline 并列打印，便于判断问题出在预筛还是解释器。
 """
-
+print('hello')
 import argparse, json, random, time, warnings
 from pathlib import Path
 
