@@ -154,18 +154,36 @@ def eval_net(net, X, y_np, g_np):
     return np.mean([trial_pred[i] == int(y_np[g_np == i][0]) for i in trial_pred])
 
 # ---------- NeuroXAI importance ----------
+# ---------- NeuroXAI importance ----------
 def neuroxai_imp(base, trials, labels, cand_idx, n_samples):
+    """
+    调用 BrainExplainer + GlobalBrainExplainer 计算全局通道重要度
+    返回长度 = 60 的 importance 向量（没被选进 cand_idx 的位置为 0）
+    """
     def clf(batch):
+        # batch: (n, 1, C, T) → softmax 概率 (n, n_cls)
         t = torch.tensor(batch[:, None, :, :], dtype=torch.float32, device=DEVICE)
         with torch.no_grad():
             out = base(t)
         return torch.softmax(out, 1).cpu().numpy()
+
     brain = BrainExplainer(25, ['short', 'long'])
     gexp  = GlobalBrainExplainer(brain)
-    gexp.explain_instance(trials[:, :, cand_idx], labels, clf, n_samples=n_samples)
+
+    # 关键：参数名必须是 num_samples ！👇
+    gexp.explain_instance(
+        x=trials[:, :, cand_idx],      # 只送 30 个候选通道
+        y=labels,
+        classifier_fn=clf,
+        num_samples=n_samples,         # ← 修正这里
+        replacement_method='mean'
+    )
+
     imp = np.zeros(N_CH)
-    imp[cand_idx] = [gexp.explain_global_channel_importance().get(i, 0.)
-                     for i in range(len(cand_idx))]
+    imp[cand_idx] = [
+        gexp.explain_global_channel_importance().get(i, 0.0)
+        for i in range(len(cand_idx))
+    ]
     return imp
 
 # ---------- 主流程 ----------
