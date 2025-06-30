@@ -216,9 +216,17 @@ def main(k_list, n_samples, use_ica=True):
         print("FBCSP-30:", [CHAN_NAMES[i] for i in cand_idx])
 
         def cv_acc_subset(sel_idx, epochs):
-            Xi = X_t[:, :, sel_idx, :].contiguous()      # 🔧避免负步长
+            # sel_idx 是 numpy array，先转成 torch.LongTensor
+            idx_tensor = torch.as_tensor(sel_idx, dtype=torch.long, device=DEVICE)
+
+            # ---------- ① 推荐：index_select ----------
+            Xi = X_t.index_select(2, idx_tensor)  # (n_win, 1, K, T)
+
+            # ---------- ② 也行，但稍慢：clone ----------
+            # Xi = X_t[:, :, sel_idx, :].clone().contiguous()
+
             scores = []
-            for tr, te in gkf.split(Xi, Yn, groups=Gn):
+            for tr, te in gkf.split(Xi.cpu().numpy(), Yn, groups=Gn):  # gkf 仍用 numpy
                 net_tmp = train_net(Xi[tr], Y_t[tr], epochs)
                 scores.append(eval_net(net_tmp, Xi[te], Yn[te], Gn[te]))
             return float(np.mean(scores)), float(np.std(scores))
