@@ -11,7 +11,7 @@ A1  基于 GroupKFold(10) 按 trial-ID 分段，baseline 不再“虚高”
 A3  额外评估 FBCSP-30 及 NeuroXAI Top-16，快速定位瓶颈
 负步长 bug  已彻底修掉（Torch 不再报 ValueError）
 """
-print('ss')
+print('sss')
 import argparse, json, random, time, warnings
 from pathlib import Path
 
