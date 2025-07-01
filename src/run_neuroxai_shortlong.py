@@ -261,7 +261,7 @@ def main(k_list, n_samples, use_ica=True):
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
     pa = argparse.ArgumentParser()
-    pa.add_argument("--k", type=int, nargs="+", default=[4, 8, 16, 32])
+    pa.add_argument("--k", type=int, nargs="+", default=[4, 8, 16, 24,32])
     pa.add_argument("--n_samples", type=int, default=800)
     pa.add_argument("--no_ica", action="store_true")
     pa.add_argument("--json", default=None, help=argparse.SUPPRESS)  # 忽略旧参数
