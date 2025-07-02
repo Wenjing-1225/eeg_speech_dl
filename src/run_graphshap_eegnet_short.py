@@ -164,11 +164,13 @@ def main():
             return torch.softmax(out, 1).cpu().numpy()
 
         explainer  = shap.KernelExplainer(predict_fn, back_flat)
-        shap_vals  = explainer.shap_values(expl_flat, nsamples=128)
-        shap_vals  = [sv.reshape(-1, N_CH, T_LEN) for sv in shap_vals]   # ★FIX
-        imp        = np.mean(np.abs(shap_vals), axis=(0, 2))             # (C,)
-        imp       /= imp.max() + 1e-6
+        # --- ② Kernel-SHAP 全局通道重要度 ---
+        shap_vals = explainer.shap_values(Xw[samp_idx], nsamples=128)  # list[n_cls]
 
+        shap_arr = np.stack(shap_vals, axis=0)  # (n_cls, n_sample, C, T)
+        imp = np.mean(np.abs(shap_arr), axis=(0, 1, 3))  # → (C,)
+
+        imp /= imp.max() + 1e-6  # 归一化，scalar now ✔
         # -- ③ Graph-GCN 10-fold CV -------------------------------
         edge_index = build_edge_index(imp, thr=0.05).to(DEVICE)
         accs = []
