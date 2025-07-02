@@ -6,9 +6,10 @@ run_graphshap_eegnet_short.py
 Short-words 三分类（in / out / up）
 
 Pipeline
-1. surrogate 1-D CNN  → 60 ch 训练
-2. Kernel-SHAP (全局) → imp[i] 通道重要度
-3. Graph-GCN(imp_i·imp_j) → 10-fold CV
+1. surrogate 1-D CNN         → 60 ch 训练
+2. Kernel-SHAP (全局)        → imp[i] 通道重要度
+3. Graph-GCN(imp_i·imp_j)    → 10-fold CV
+结果写入 results/graphshap_short.json
 """
 import json, random, warnings
 from pathlib import Path
@@ -24,16 +25,12 @@ from scipy.io import loadmat
 from scipy.signal import butter, filtfilt, iirnotch
 
 # ---------- 全局超参 ----------
-SEED        = 0
-FS          = 256
+SEED, FS = 0, 256
 WIN_S, STEP_S = 2.0, .5
-WIN,  STEP  = int(WIN_S * FS), int(STEP_S * FS)       # 每窗 T 点
-BATCH       = 128
-EPOCH_SUR   = 60
-EPOCH_GCN   = 80
-SHAP_SAMP   = 256
-DROP_FIXED  = {0, 9, 32, 63}
-N_CLASS     = 3
+WIN, STEP = int(WIN_S * FS), int(STEP_S * FS)         # 每窗 T 点
+BATCH, EPOCH_SUR, EPOCH_GCN = 128, 60, 80
+SHAP_SAMP, N_CLASS = 256, 3
+DROP_FIXED = {0, 9, 32, 63}
 
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -48,9 +45,7 @@ k0     = next(k for k in first if k.endswith('last_beep'))
 n_tot  = first[k0][0][0].shape[0]
 
 keep_idx = [i for i in range(n_tot) if i not in DROP_FIXED]   # 60 通道
-N_CH     = len(keep_idx)
-T_LEN    = WIN
-FLAT     = N_CH * T_LEN
+N_CH, T_LEN, FLAT = len(keep_idx), WIN, len(keep_idx) * WIN
 
 bp_b, bp_a = butter(4, [4, 40], fs=FS, btype='band')
 nt_b, nt_a = iirnotch(60, 30, fs=FS)
@@ -60,7 +55,7 @@ def preprocess(sig):
     sig = filtfilt(nt_b, nt_a, sig, axis=1)
     sig = filtfilt(bp_b, bp_a, sig, axis=1)
     sig -= sig.mean(1, keepdims=True)
-    sig /= sig.std (1, keepdims=True) + 1e-6
+    sig /= sig.std(1, keepdims=True) + 1e-6
     return sig.astype(np.float32)
 
 def slide(sig, tid):
@@ -105,8 +100,7 @@ def build_edge_index(imp, thr=0.0):
     return torch.tensor([src, dst], dtype=torch.long)
 
 def win_to_graph(win, edge_index):
-    # win: (C,T)  →  节点=C   特征=T
-    x = torch.tensor(win, dtype=torch.float32)          # 注意不转置
+    x = torch.tensor(win, dtype=torch.float32)          # (C,T)
     return Data(x=x, edge_index=edge_index, y=None)
 
 # ---------- 主流程 ----------
@@ -126,8 +120,7 @@ def main():
         Xw, Yn, Gn = [], [], []
         for tid, (sig, lab) in enumerate(zip(trials, labels)):
             wins, gids = slide(sig, tid)
-            Xw.extend(wins); Yn.extend([lab] * len(wins)); Gn.extend(gids)
-
+            Xw.extend(wins); Yn.extend([lab]*len(wins)); Gn.extend(gids)
         Xw = np.stack(Xw)                               # (n_win, C, T)
         X_t = torch.tensor(Xw[:, None, :, :], device=DEVICE)
         Y_t = torch.tensor(Yn, device=DEVICE)
@@ -145,32 +138,34 @@ def main():
                 loss = cri(net_s(X_t[sl]), Y_t[sl])
                 loss.backward(); opt_s.step()
 
-        # -------- ② Kernel-SHAP 全局通道重要度 --------
-        samp_idx   = np.random.choice(len(Xw),
-                                      size=min(SHAP_SAMP, len(Xw)),
-                                      replace=False)
-        back_flat  = Xw[samp_idx[:32]].reshape(32, FLAT)      # (32, C*T)
-        expl_flat  = Xw[samp_idx].reshape(-1,  FLAT)          # (n , C*T)
+        # -------- ② Kernel-SHAP  --------
+        samp_idx  = np.random.choice(len(Xw),
+                                     size=min(SHAP_SAMP, len(Xw)),
+                                     replace=False)
+        back_flat = Xw[samp_idx[:32]].reshape(32, FLAT)   # (32, C*T)
+        expl_flat = Xw[samp_idx].reshape(-1, FLAT)        # (n,  C*T)
 
         def predict_fn(arr2d):
             n = arr2d.shape[0]
             x4d = torch.tensor(arr2d.reshape(n, N_CH, T_LEN),
-                               device=DEVICE).unsqueeze(1)    # (n,1,C,T)
+                               device=DEVICE).unsqueeze(1)  # (n,1,C,T)
             with torch.no_grad():
                 out = net_s(x4d)
             return torch.softmax(out, 1).cpu().numpy()
 
-        explainer = shap.KernelExplainer(predict_fn, back_flat)
-        shap_vals = explainer.shap_values(expl_flat, nsamples=128)  # list[n_cls]
+        explainer  = shap.KernelExplainer(predict_fn, back_flat)
+        shap_vals  = explainer.shap_values(expl_flat, nsamples=128)  # list[n_cls]
 
-        shap_arr  = np.stack(shap_vals, axis=0)                       # (n_cls,n_s, C*T)
-        n_cls, n_samples = shap_arr.shape[0], shap_arr.shape[1]
-        shap_arr = shap_arr.reshape(n_cls, n_samples, N_CH, T_LEN)    # →(n_cls,n_s,C,T)
+        # -------- 通道重要度：逐类累加再平均 --------
+        imp = np.zeros(N_CH)
+        for cls_vals in shap_vals:                         # (n_s, C*T)
+            cls_vals = cls_vals.reshape(-1, N_CH, T_LEN)   # (n_s, C, T)
+            imp += np.abs(cls_vals).mean(axis=(0, 2))      # Σ|·|
 
-        imp = np.mean(np.abs(shap_arr), axis=(0, 1, 3))               # (C,)
-        imp /= imp.max() + 1e-6
+        imp /= len(shap_vals)                              # 类别平均
+        imp /= imp.max() + 1e-6                            # 归一化
 
-        # -------- ③ Graph-GCN 10-fold CV --------
+        # -------- ③ Graph-GCN 十折 CV --------
         edge_index = build_edge_index(imp, thr=0.05).to(DEVICE)
         accs = []
 
