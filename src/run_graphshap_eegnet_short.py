@@ -165,12 +165,32 @@ def main():
 
         explainer  = shap.KernelExplainer(predict_fn, back_flat)
         # --- ② Kernel-SHAP 全局通道重要度 ---
-        shap_vals = explainer.shap_values(Xw[samp_idx], nsamples=128)  # list[n_cls]
+        samp_idx = np.random.choice(len(Xw),  # 采样窗口
+                                    size=min(SHAP_SAMP, len(Xw)),
+                                    replace=False)
 
-        shap_arr = np.stack(shap_vals, axis=0)  # (n_cls, n_sample, C, T)
-        imp = np.mean(np.abs(shap_arr), axis=(0, 1, 3))  # → (C,)
+        back_flat = Xw[samp_idx[:32]].reshape(32, FLAT)  # (32 , C*T)
+        expl_flat = Xw[samp_idx].reshape(-1, FLAT)  # (n , C*T)
 
-        imp /= imp.max() + 1e-6  # 归一化，scalar now ✔
+        def predict_fn(arr2d):
+            n = arr2d.shape[0]
+            x4d = torch.tensor(arr2d.reshape(n, N_CH, T_LEN),  # ← 复原
+                               device=DEVICE).unsqueeze(1)  # (n,1,C,T)
+            with torch.no_grad():
+                out = net_s(x4d)
+            return torch.softmax(out, 1).cpu().numpy()
+
+        explainer = shap.KernelExplainer(predict_fn, back_flat)
+        shap_vals = explainer.shap_values(expl_flat, nsamples=128)  # list[n_cls]
+
+        # list → ndarray → 复原 (C,T) 维度
+        shap_arr = np.stack(shap_vals, axis=0)  # (n_cls, n, C*T)
+        shap_arr = shap_arr.reshape(len(shap_vals),  # n_cls
+                                    shap_arr.shape[1],  # n_sample
+                                    N_CH, T_LEN)  # C, T
+
+        imp = np.mean(np.abs(shap_arr), axis=(0, 1, 3))  # (C,)
+        imp /= imp.max() + 1e-6
         # -- ③ Graph-GCN 10-fold CV -------------------------------
         edge_index = build_edge_index(imp, thr=0.05).to(DEVICE)
         accs = []
