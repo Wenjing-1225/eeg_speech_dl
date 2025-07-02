@@ -118,7 +118,7 @@ def main():
     results, gkf = {}, GroupKFold(10)
 
     for subj_i, matf in enumerate(FILES, 1):
-        print(f"\n=== Subject {subj_i}/{len(FILES)} ({matf.name.name}) ===")
+        print(f"\n=== Subject {subj_i}/{len(FILES)} ({matf.name}) ===")
         # -- 读取 & 预处理 --
         m   = loadmat(matf, simplify_cells=True)
         key = next(k for k in m if k.endswith("last_beep"))
