@@ -201,16 +201,30 @@ def main(k_top=[4,8,16,24,32]):
         sur = MultiModalNet(N_CH, psd_bins=PSD_BINS, n_cls=2).to(DEVICE)
         full_dl = make_loader(np.arange(len(Xt)),Xt,Xp,Xe,Yn,Gn,True)
         train(sur,full_dl,EPOCH_BASE)
-
         # SHAP
         samp = np.random.choice(len(Xt), SHAP_SAMP, False)
-        back = Xt[samp[:32]].cpu().numpy().reshape(32,-1)
-        expl = Xt[samp].cpu().numpy().reshape(-1,N_CH*T_LEN)
-        def pred(arr):
-            x = torch.tensor(arr.reshape(-1,1,N_CH,T_LEN),device=DEVICE)
+        back = Xt[samp[:32]].cpu().numpy().reshape(32, -1)
+        expl = Xt[samp].cpu().numpy().reshape(-1, N_CH * T_LEN)
+
+        # >>> 仅用时域做替代分析 —— 临时换 head <<<
+        orig_head = sur.head  # 1) 备份
+        sur.head_time = nn.Linear(32, N_CLASS).to(DEVICE)
+        nn.init.xavier_uniform_(sur.head_time.weight)
+        sur.head_time.bias.data.zero_()
+
+        def pred(arr2d):
+            x = torch.tensor(arr2d.reshape(-1, 1, N_CH, T_LEN), device=DEVICE)
             with torch.no_grad():
-                feat = sur.time(x); out = sur.head(feat)
-            return torch.softmax(out,1).cpu().numpy()
+                feat = sur.time(x)  # 只有时域 32 维
+                out = sur.head_time(feat)  # 用 32→2 的临时 head
+            return torch.softmax(out, 1).cpu().numpy()
+
+        explainer = shap.KernelExplainer(pred, back)
+        sv = explainer.shap_values(expl, nsamples=128)
+
+        # 用完立即恢复
+        sur.head_time = None
+        sur.head = orig_head  # 2) 还原
         shap_exp = shap.KernelExplainer(pred, back)
         sv = shap_exp.shap_values(expl, nsamples=128)
         sv = np.stack(sv,0).reshape(N_CLASS,len(expl),N_CH,T_LEN)
