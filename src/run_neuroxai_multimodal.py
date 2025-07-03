@@ -65,8 +65,7 @@ def preprocess(sig):
 
     psd = None; imf = None
     if USE_PSD:
-        -        _, Pxx = welch(sig_t, fs=FS, nperseg=WIN, axis=1)
-        +        _, Pxx = welch(sig_t, fs=FS, nperseg=256, axis=1)
+        _, Pxx = welch(sig_t, fs=FS, nperseg=256, axis=1)
         # (C,F)
         psd = np.log(Pxx + 1e-12).astype(np.float32)             # (C,PSD_BINS)
 
