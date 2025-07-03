@@ -52,8 +52,8 @@ nt_b, nt_a = iirnotch(60, 30, fs=FS)
 emd = EMD()
 
 # Welch 得到的频点数（与 nperseg=WIN 对应）
-_, Pxx_demo = welch(np.zeros(WIN), fs=FS, nperseg=WIN)
-PSD_BINS = Pxx_demo.shape[-1]                       # == 257
+_, Pxx_demo = welch(np.zeros(WIN), fs=FS, nperseg=256)  # 129 bins
+PSD_BINS = Pxx_demo.shape[-1]                     # == 257
 
 # ---------- 数据预处理 ----------
 def preprocess(sig):
@@ -65,8 +65,10 @@ def preprocess(sig):
 
     psd = None; imf = None
     if USE_PSD:
-        _, Pxx = welch(sig_t, fs=FS, nperseg=WIN, axis=1)          # (C,F)
-        psd = np.log(Pxx + 1e-12).astype(np.float32)               # (C,PSD_BINS)
+        -        _, Pxx = welch(sig_t, fs=FS, nperseg=WIN, axis=1)
+        +        _, Pxx = welch(sig_t, fs=FS, nperseg=256, axis=1)
+        # (C,F)
+        psd = np.log(Pxx + 1e-12).astype(np.float32)             # (C,PSD_BINS)
 
     if USE_EWT:
         imfs=[]
