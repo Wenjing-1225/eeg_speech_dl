@@ -6,7 +6,6 @@ tqdm
 mne
 pyriemann
 PyWavelets
-pywt-data
 shap
 torch_geometric
 EMD-signal
