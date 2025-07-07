@@ -11,3 +11,4 @@ lime tqdm
 shap
 torch_geometric
 EMD-signal
+vmdpy
