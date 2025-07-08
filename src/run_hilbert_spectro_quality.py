@@ -33,6 +33,11 @@ NUM_WORKERS  = 0        # macOS 先设 0，跑通再调大
 DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 REDUCE_DATA  = False    # True→只抽少量 trial 便于快速测试
 
+print("Using device:", DEVICE)
+print("Is MPS available:", torch.backends.mps.is_available())
+print("Is CUDA available:", torch.cuda.is_available())
+print("Device name:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "MPS/CPU")
+
 # ============ 主逻辑 ============ #
 def main():
     random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
