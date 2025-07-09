@@ -315,8 +315,10 @@ def train_model(k_imf: int | None = None, batch_size: int = 32, epochs: int = 50
                 lr: float = 1e-3, device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
     train_ds = HilbertSpectrumDataset(k_imf=k_imf, train=True)
     val_ds = HilbertSpectrumDataset(k_imf=k_imf, train=False)
-    tl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4)
-    vl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4)
+    # tl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4)
+    # vl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4)
+    tl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
+    vl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
     model = ConvNet().to(device)
     crit = nn.CrossEntropyLoss()
