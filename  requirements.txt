@@ -10,3 +10,6 @@ shap
 torch_geometric
 EMD-signal
 vmdpy
+torchvision
+PyEMD
+torch
