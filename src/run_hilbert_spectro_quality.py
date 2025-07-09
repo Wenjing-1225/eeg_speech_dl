@@ -1,191 +1,378 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-run_hilbert_spectro_quality.py
-------------------------------
-一次生成 Hilbert-Spectrum 缓存 + 15-layer CNN 训练 / 10-fold CV
-—————————————————————————————————————————————————————————
-• 数据     : data/Short_words/*.mat   (Agarwal & Kumar 同格式)
-• 输出     : df_metrics.csv, corr_metrics.csv, 10-fold 准确率
-• 运行步骤 : 第一次 ⇒ 自动生成 cached_hs/*.pt   以后 ⇒ 直接训练
+EEG Pre‑processing → Hilbert‑Huang Transform → CNN classification
+===============================================================
+Author : ChatGPT (OpenAI o3)
+Updated: 2025‑07‑09
+
+Pipeline
+--------
+1. **滤波**：1‑40 Hz 双向 Butterworth + 50 Hz notch
+2. **CAR**：通道均值参考
+3. **Hilbert 包络归一化**
+4. **EMD**：能量排名选前 *k* 个 IMF
+5. **Hilbert Spectrum** 热力图缓存到 `cached_hs/k{k}/<subject>/<label>/trial_N.png`
+6. **PyTorch CNN** 读取光谱图做三分类
+
+用法示例
+^^^^^^^^
+```bash
+# 生成 Hilbert Spectrum（选前 3 个 IMF）
+python src/run_hilbert_spectro_quality.py --make-cache --k 3
+
+# 训练 CNN
+python src/run_hilbert_spectro_quality.py --train --k 3 --epochs 50
+```
+
+依赖
+----
+```
+numpy<2, scipy, matplotlib, mne, PyEMD, pillow, torch, torchvision
+```
 """
-print('hello')
-import io, random, warnings, time
+from __future__ import annotations
+import argparse, multiprocessing as mp, os, re, math, json
 from pathlib import Path
+from typing import List, Tuple, Dict, Optional
 
-import numpy as np, pandas as pd
-from scipy.io import loadmat
-from scipy.signal import butter, filtfilt, hilbert, welch
-from PyEMD import EMD                          # pip install EMD-signal
+import numpy as np
 import matplotlib.pyplot as plt
-import torch, torch.nn as nn
+from matplotlib.colors import LogNorm
+from scipy.io import loadmat
+from scipy.signal import butter, sosfiltfilt, hilbert
+import mne  # noqa: F401  # 备用：高级滤波/去伪迹
+from PIL import Image
+import torch
+from torch import nn
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import GroupKFold
+from torchvision import transforms
+from functools import partial
 
-# ---------------- 全局参数 ----------------
-SEED = 0
-FS   = 256
-WIN_S, STEP_S = 2.0, 0.5
-WIN, STEP = int(WIN_S*FS), int(STEP_S*FS)
-DROP_FIXED = {0, 9, 32, 63}
-N_CLASS    = 3        # ← 改成 5 即可
-BATCH      = 64
-EPOCH      = 120
-NUM_WORKERS_TRAIN = 4   # Linux/GPU 建议 >=4，Mac/Win 请改 0
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ---------------------------------------------------------------------------
+# 全局路径 & 常量
+# ---------------------------------------------------------------------------
+PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
+DATA_DIR: Path = PROJECT_ROOT / "data" / "Short_words"
+CACHE_DIR: Path = PROJECT_ROOT / "cached_hs"
+CACHE_DIR.mkdir(exist_ok=True)
 
-# --- 路径设置：始终相对脚本所在目录的上一级 -------------
-PROJECT_ROOT = Path(__file__).resolve().parents[1]     # ← 项目根
-DATA         = PROJECT_ROOT / "data" / "Short_words"   # data/Short_words/
-CACHE        = PROJECT_ROOT / "cached_hs"
-CACHE.mkdir(exist_ok=True)
+# >>> 新增：自动从文件名中解析被试 ID（支持 sub_6b 这类带字母后缀）
+SUBJECTS: List[str] = sorted(
+    {re.match(r"(sub_[A-Za-z0-9]+)", p.name).group(1)
+     for p in DATA_DIR.glob("sub_*_256Hz.mat")}
+)
+EEG_SAMPLING_RATE = 256  # Hz
+RAW_EXT = ".mat"
 
-random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
-warnings.filterwarnings("ignore", category=UserWarning)  # matplotlib/Torch 杂项
+# ---------------------------------------------------------------------------
+# 滤波工具
+# ---------------------------------------------------------------------------
 
-print(">>> Torch device:", DEVICE)
+def _bandpass_sos(l_freq: float, h_freq: float, sfreq: float, order: int = 4):
+    return butter(order, [l_freq, h_freq], btype="band", fs=sfreq, output="sos")
 
-# ---------------- 预处理工具 ----------------
-bp_b, bp_a = butter(4, [4, 40], fs=FS, btype="band")
-nt_b, nt_a = butter(2, [48, 52], fs=FS, btype="bandstop")
 
-first = loadmat(next(DATA.glob("*.mat")), simplify_cells=True)
-key0  = next(k for k in first if k.endswith("last_beep"))
-n_tot = first[key0][0][0].shape[0]
-keep_i = [i for i in range(n_tot) if i not in DROP_FIXED]
+def bandpass_filter(x: np.ndarray, l_freq: float = 1.0, h_freq: float = 40.0,
+                    sfreq: float = EEG_SAMPLING_RATE, order: int = 4) -> np.ndarray:
+    return sosfiltfilt(_bandpass_sos(l_freq, h_freq, sfreq, order), x, axis=-1)
 
-def preprocess(sig: np.ndarray) -> np.ndarray:
-    sig = sig[keep_i]
-    sig = filtfilt(nt_b, nt_a, sig, axis=1)
-    sig = filtfilt(bp_b, bp_a, sig, axis=1)
-    sig = (sig - sig.mean(1, keepdims=True)) / (sig.std(1, keepdims=True)+1e-6)
-    return sig.astype(np.float32)
 
-def slide(sig, label, tid, subj):
-    for st in range(0, sig.shape[1]-WIN+1, STEP):
-        yield dict(win=sig[:,st:st+WIN], label=label,
-                   trial=tid, subj=subj, st=st)
+def notch_filter(x: np.ndarray, band: Tuple[float, float] = (49, 51),
+                 sfreq: float = EEG_SAMPLING_RATE, order: int = 2) -> np.ndarray:
+    sos = butter(order, band, btype="bandstop", fs=sfreq, output="sos")
+    return sosfiltfilt(sos, x, axis=-1)
 
-# ---------------- 生成 Hilbert-Spectrum 图像 ----------------
-def hs_image(win, imf_k=3) -> torch.Tensor:
-    emd, ims = EMD(), []
-    for ch in win:
-        imfs = emd(ch)[:imf_k]
-        energy = np.abs(hilbert(imfs, axis=1))**2
-        ims.append(energy)
-    hs = np.mean(np.stack(ims,0),0)
-    hs = (hs - hs.min()) / (hs.max() - hs.min() + 1e-9)
 
-    fig = plt.figure(figsize=(8.75,6.56), dpi=100)
-    plt.axis("off"); plt.imshow(hs, aspect="auto", cmap="viridis", origin="lower")
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", bbox_inches="tight", pad_inches=0); plt.close(fig)
-    buf.seek(0)
-    img = plt.imread(buf)[:,:,:3]          # H×W×3
-    img = (img - img.mean()) / img.std()
-    return torch.tensor(img.transpose(2,0,1), dtype=torch.float32)
+def car_reference(x: np.ndarray) -> np.ndarray:
+    return x - x.mean(axis=0, keepdims=True)
 
-def build_cache():
-    """若有缺失 .pt 文件则自动补齐"""
-    need = False
-    for si, mfile in enumerate(sorted(DATA.glob("*.mat"))):
-        m   = loadmat(mfile, simplify_cells=True)
-        key = next(k for k in m if k.endswith("last_beep"))
-        trials = [preprocess(tr) for cls in m[key] for tr in cls]
-        for tid, tri in enumerate(trials):
-            for st in range(0, tri.shape[1]-WIN+1, STEP):
-                pt = CACHE / f"S{si}_{tid}_{st}.pt"
-                if not pt.exists():
-                    need = True; break
-        if need: break
-    if not need:
-        print("✓ HS cache 已存在，跳过生成"); return
+# ---------------------------------------------------------------------------
+# Hilbert–Huang 工具
+# ---------------------------------------------------------------------------
 
-    print("🔄 正在生成 Hilbert-Spectrum 缓存（一次性） ...")
-    t0=time.time()
-    for si, mfile in enumerate(sorted(DATA.glob("*.mat"))):
-        m   = loadmat(mfile, simplify_cells=True)
-        key = next(k for k in m if k.endswith("last_beep"))
-        trials = [preprocess(tr) for cls in m[key] for tr in cls]
-        for tid, tri in enumerate(trials):
-            for st in range(0, tri.shape[1]-WIN+1, STEP):
-                pt = CACHE / f"S{si}_{tid}_{st}.pt"
-                if pt.exists(): continue
-                torch.save(hs_image(tri[:,st:st+WIN]), pt)
-    print(f"✅ 缓存生成完成，用时 {time.time()-t0:.1f}s\n")
+def emd_decompose(sig: np.ndarray, max_imf: int | None = None) -> List[np.ndarray]:
+    # 这里再 import 一次没关系，Python 会从缓存里取，开销极小
+    from PyEMD.EMD import EMD as _EMD
+    emd = _EMD()                # ← 现在 100% 是类，可实例化
+    imfs = emd.emd(sig)
+    return imfs[:max_imf] if max_imf else imfs
 
-# ---------------- Dataset ----------------
-class HSDataset(Dataset):
-    def __init__(self, idxs, meta):
-        self.idxs, self.meta = idxs, meta
-    def __len__(self): return len(self.idxs)
-    def __getitem__(self, i):
-        rec = self.meta[self.idxs[i]]
-        x = torch.load(CACHE / f"S{rec['subj']}_{rec['trial']}_{rec['st']}.pt")
-        return x, rec['label']
 
-# ---------------- CNN ----------------
-class PaperCNN(nn.Module):
-    def __init__(self, n_cls=N_CLASS):
+def energy_rank(imfs: List[np.ndarray]) -> List[int]:
+    return np.argsort([np.sum(i ** 2) for i in imfs])[::-1].tolist()
+
+
+def compute_hilbert_spectrum(imfs: List[np.ndarray], sfreq: float,
+                              t: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    E_list, F_list = [], []
+    for imf in imfs:
+        analytic = hilbert(imf)
+        amp = np.abs(analytic)
+        phase = np.unwrap(np.angle(analytic))
+        freq = np.concatenate((np.diff(phase), [0])) * sfreq / (2 * np.pi)
+        E_list.append(amp)
+        F_list.append(freq)
+    return t, np.vstack(F_list), np.vstack(E_list)
+
+
+def save_hilbert_spectrum_png(t: np.ndarray, F: np.ndarray, E: np.ndarray,
+                              out_png: Path, dpi: int = 150):
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    E = np.where(F <= 0, 0, E)
+    T = np.tile(t, (F.shape[0], 1))
+    plt.figure(figsize=(8, 4))
+    plt.pcolormesh(T, F, E, shading = 'auto',norm = LogNorm(vmin=E[E > 0].min(), vmax=E.max()))
+    plt.colorbar(label="Amplitude")
+    plt.xlabel("Time [s]")
+    plt.ylabel("Frequency [Hz]")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=dpi)
+    plt.close()
+
+# ---------------------------------------------------------------------------
+# 数据读入
+# ---------------------------------------------------------------------------
+
+def _assemble_from_object_array(raw: np.ndarray) -> Dict[str, np.ndarray]:
+    """raw: object array shaped (classes, trials) with each element (ch,samp)"""
+    signals, labels = [], []
+    for cls_idx in range(raw.shape[0]):
+        for trial in raw[cls_idx]:
+            signals.append(trial.astype(np.float32))
+            labels.append(cls_idx)
+    return {"signals": np.stack(signals), "labels": np.array(labels, int)}
+
+
+def load_subject_mat(subject: str, var_pattern: str = r"eeg_data.*256Hz") -> Dict[str, np.ndarray]:
+    # >>> 改为 glob 搜索，以免严格文件名不匹配
+    cand = list(DATA_DIR.glob(f"{subject}*_256Hz.mat"))
+    if not cand:
+        raise FileNotFoundError(f"No .mat file for {subject} in {DATA_DIR}")
+    mat_path = cand[0]                     # 若同一 subject 有多文件可自行再加逻辑
+    mat = loadmat(mat_path)
+
+    # 优先检测明确字段
+    if mat.get("signals") is not None and mat.get("labels") is not None:
+        return {"signals": mat["signals"].astype(np.float32),
+                "labels": mat["labels"].flatten().astype(int)}
+
+    # 否则用正则匹配对象数组 (classes × trials)
+    data_key = next((k for k in mat if re.match(var_pattern, k, flags=re.I)), None)
+    if data_key is None:
+        raise KeyError(f"No EEG variable matching '{var_pattern}' found in {mat_path.name}")
+    return _assemble_from_object_array(mat[data_key])
+
+# ---------------------------------------------------------------------------
+# 光谱缓存
+# ---------------------------------------------------------------------------
+
+def process_trial(subject: str, trial_idx: int, k_imf: int | None = None,
+                  l_freq: float = 1.0, h_freq: float = 40.0) -> Path:
+    subj = load_subject_mat(subject)
+    sig_raw = subj['signals'][trial_idx]      # (ch, samples)
+    label = subj['labels'][trial_idx]
+
+    # 预处理
+    sig = bandpass_filter(sig_raw, l_freq, h_freq)
+    sig = notch_filter(sig)
+    sig = car_reference(sig)
+
+    # Hilbert 包络归一化
+    analytic = hilbert(sig, axis=1)
+    env = np.abs(analytic)
+    sig_norm = sig / (env + 1e-12)
+
+    # 多通道取平均，也可改为挑选特定通道
+    sig_mean = sig_norm.mean(axis=0)
+
+    imfs = emd_decompose(sig_mean)
+    if k_imf is not None:
+        imfs = [imfs[i] for i in energy_rank(imfs)[:k_imf]]
+
+    n = sig_mean.size
+    t = np.arange(n) / EEG_SAMPLING_RATE
+    t, F, E = compute_hilbert_spectrum(imfs, EEG_SAMPLING_RATE, t)
+
+    out_png = CACHE_DIR / f"k{k_imf or 'all'}" / subject / str(label) / f"trial_{trial_idx}.png"
+    if not out_png.exists():
+        save_hilbert_spectrum_png(t, F, E, out_png)
+    return out_png
+
+
+
+def build_cache(k_imf: int | None = None, workers: int = 0):
+    jobs: list[tuple[str, int]] = []
+    for subj in SUBJECTS:
+        try:
+            subj_data = load_subject_mat(subj)
+        except FileNotFoundError as e:     # 理论上不会再触发，但稳妥起见
+            print(e); continue
+        for tri in range(len(subj_data['signals'])):
+            jobs.append((subj, tri))
+
+    if workers <= 1:
+        for s, t_idx in jobs:
+            process_trial(s, t_idx, k_imf=k_imf)
+    else:
+        with mp.Pool(processes=workers) as pool:
+            # >>> 用 partial 固定 k_imf，避免 lambda
+            pool.starmap(partial(process_trial, k_imf=k_imf), jobs)
+
+# ---------------------------------------------------------------------------
+# PyTorch Dataset
+# ---------------------------------------------------------------------------
+class HilbertSpectrumDataset(Dataset):
+    def __init__(self, k_imf: int | None = None, train: bool = True,
+                 val_split: float = 0.2, seed: int = 42):
+        self.root = CACHE_DIR / f"k{k_imf or 'all'}"
+        # transforms
+        tf = transforms.Compose([
+            transforms.Resize((656, 875)),  # 保持与论文一致
+            transforms.ToTensor(),
+            transforms.Normalize([0.5] * 3, [0.5] * 3)
+        ])
+        self.samples: List[Tuple[Path, int]] = []
+        for subj_dir in self.root.iterdir():
+            if not subj_dir.is_dir():  # ← 跳过 .DS_Store 等非目录
+                continue
+            for label_dir in subj_dir.iterdir():
+                if not label_dir.is_dir():  # ← 再次过滤
+                    continue
+                label = int(label_dir.name)
+                for img in label_dir.glob("*.png"):
+                    self.samples.append((img, label))
+        # 固定随机切分
+        rng = np.random.default_rng(seed)
+        rng.shuffle(self.samples)
+        split = int(len(self.samples)*(1-val_split))
+        self.samples = self.samples[:split] if train else self.samples[split:]
+        self.transform = tf
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        p, y = self.samples[idx]
+        x = Image.open(p).convert('RGB')
+        x = self.transform(x)
+        return x, y
+
+# ---------------------------------------------------------------------------
+# 简易 CNN
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+#   CNN-3  ⇢ 8-16-32  + BN + ReLU + MaxPool
+#   输入默认 3×656×875，可用 transforms.Resize((656, 875))
+# ---------------------------------------------------------------------------
+class ConvNet(nn.Module):
+    def __init__(self, num_classes: int = 3):
         super().__init__()
-        self.fea = nn.Sequential(
-            nn.Conv2d(3,8,3,padding=1),  nn.BatchNorm2d(8),  nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(8,16,3,padding=1), nn.BatchNorm2d(16), nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(16,32,3,padding=1),nn.BatchNorm2d(32), nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1,1))
+
+        self.features = nn.Sequential(
+            # ① 3×3 Conv, 8ch
+            nn.Conv2d(3, 8, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(8, eps=1e-5),        # epsilon 1e-5≈0.00001
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # ② 3×3 Conv, 16ch
+            nn.Conv2d(8, 16, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(16, eps=1e-5),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+
+            # ③ 3×3 Conv, 32ch
+            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(32, eps=1e-5),
+            nn.ReLU(inplace=True),
         )
-        self.fc = nn.Linear(32, n_cls)
-    def forward(self,x): return self.fc(self.fea(x).flatten(1))
 
-# ---------------- 训练 + 10-fold CV ----------------
-def main():
-    build_cache()
+        # 原图 656×875 经过两次 2×2 pooling → 164×218
+        # 第三层后不再池化，直接全局平均
+        self.global_pool = nn.AdaptiveAvgPool2d(1)   # 输出 32×1×1
+        self.classifier  = nn.Linear(32, num_classes)
 
-    # ---- 构造 meta 信息 ----
-    meta=[]
-    for si, mfile in enumerate(sorted(DATA.glob("*.mat"))):
-        m   = loadmat(mfile, simplify_cells=True)
-        key = next(k for k in m if k.endswith("last_beep"))
-        trials=[preprocess(tr) for cls in m[key] for tr in cls]
-        labels=[cls for cls,t in enumerate(m[key]) for _ in t]
-        for tid,(tri,y) in enumerate(zip(trials,labels)):
-            for rec in slide(tri, y, tid, si):
-                meta.append(rec)
+        # weight init ≈ ‘glorot’ (aka Xavier uniform)
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
 
-    print("Total windows:", len(meta))
-    groups=[r['trial'] for r in meta]
-    labels=[r['label'] for r in meta]
-    gkf=GroupKFold(10)
+    def forward(self, x):
+        x = self.features(x)
+        x = self.global_pool(x).flatten(1)
+        return self.classifier(x)
 
-    fold_acc=[]
-    for fold,(tr,te) in enumerate(gkf.split(np.arange(len(meta)), labels, groups)):
-        print(f"\n=== Fold {fold} ===")
-        dl_tr = DataLoader(HSDataset(tr, meta), BATCH, True,
-                           num_workers=NUM_WORKERS_TRAIN, pin_memory=False)
-        dl_te = DataLoader(HSDataset(te, meta), BATCH, False,
-                           num_workers=NUM_WORKERS_TRAIN, pin_memory=False)
+# ---------------------------------------------------------------------------
+# 训练循环
+# ---------------------------------------------------------------------------
 
-        net = PaperCNN().to(DEVICE)
-        opt = torch.optim.Adam(net.parameters(), 1e-3, weight_decay=1e-4)
-        cri = nn.CrossEntropyLoss()
+def train_model(k_imf: int | None = None, batch_size: int = 32, epochs: int = 50,
+                lr: float = 1e-3, device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
+    train_ds = HilbertSpectrumDataset(k_imf=k_imf, train=True)
+    val_ds = HilbertSpectrumDataset(k_imf=k_imf, train=False)
+    tl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4)
+    vl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4)
 
-        net.train()
-        for _ in range(EPOCH):
-            for xb,yb in dl_tr:
-                xb,yb = xb.to(DEVICE), yb.to(DEVICE)
-                opt.zero_grad(); cri(net(xb), yb).backward(); opt.step()
+    model = ConvNet().to(device)
+    crit = nn.CrossEntropyLoss()
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
 
-        net.eval(); correct=total=0
+    best_acc = 0.0
+    for ep in range(1, epochs+1):
+        model.train(); running = 0.0
+        for x, y in tl:
+            x, y = x.to(device), y.to(device)
+            opt.zero_grad(); out = model(x); loss = crit(out, y)
+            loss.backward(); opt.step()
+            running += loss.item()*x.size(0)
+        train_loss = running/len(train_ds)
+
+        # 验证
+        model.eval(); correct = 0
         with torch.no_grad():
-            for xb,yb in dl_te:
-                pred = net(xb.to(DEVICE)).argmax(1).cpu()
-                correct += (pred==yb).sum().item(); total += len(yb)
-        acc=correct/total; fold_acc.append(acc)
-        print(f"Fold acc = {acc:.3f}")
+            for x, y in vl:
+                x, y = x.to(device), y.to(device)
+                pred = model(x).argmax(1)
+                correct += (pred==y).sum().item()
+        acc = correct/len(val_ds)
+        best_acc = max(best_acc, acc)
+        print(f"[Ep {ep:03d}] loss {train_loss:.4f}  val {acc*100:.2f}%  best {best_acc*100:.2f}%")
 
-    print("\nMean 10-fold acc =", np.mean(fold_acc))
+    model_out = PROJECT_ROOT / f"cnn_k{k_imf or 'all'}.pt"
+    torch.save(model.state_dict(), model_out)
+    print(f"Model saved → {model_out}")
 
-if __name__ == "__main__":
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser("EEG‑HHT‑CNN pipeline")
+    p.add_argument('--make-cache', action='store_true', help='Generate Hilbert spectra')
+    p.add_argument('--train', action='store_true', help='Train CNN')
+    p.add_argument('--k', type=int, default=None, help='Top‑k IMFs (energy)')
+    p.add_argument('--epochs', type=int, default=50)
+    p.add_argument('--batch-size', type=int, default=32)
+    p.add_argument('--lr', type=float, default=1e-3)
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.make_cache:
+        print("Generating Hilbert spectrum cache …")
+        build_cache(k_imf=args.k, workers=max(mp.cpu_count()-1, 1))
+    if args.train:
+        print("Training CNN …")
+        train_model(k_imf=args.k, batch_size=args.batch_size, epochs=args.epochs, lr=args.lr)
+    if not (args.make_cache or args.train):
+        print("Nothing to do – use --make-cache and/or --train. See --help")
+
+
+if __name__ == '__main__':
     main()
