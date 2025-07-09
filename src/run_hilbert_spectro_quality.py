@@ -9,7 +9,7 @@ run_hilbert_spectro_quality.py
 • 输出     : df_metrics.csv, corr_metrics.csv, 10-fold 准确率
 • 运行步骤 : 第一次 ⇒ 自动生成 cached_hs/*.pt   以后 ⇒ 直接训练
 """
-
+print('hello')
 import io, random, warnings, time
 from pathlib import Path
 
