@@ -221,40 +221,32 @@ def build_cache(k_imf: int | None = None, workers: int = 0):
 # ---------------------------------------------------------------------------
 # PyTorch Dataset
 # ---------------------------------------------------------------------------
-class HilbertSpectrumDataset(Dataset):
-    def __init__(self, k_imf: int | None = None, train: bool = True,
-                 val_split: float = 0.2, seed: int = 42):
-        self.root = CACHE_DIR / f"k{k_imf or 'all'}"
-        # transforms
+class SubjDataset(Dataset):
+    """单受试者数据集；内部再 8:2 切 train/val"""
+    def __init__(self, subject: str, k_imf: int | None,
+                 train: bool, split: float = 0.8, seed: int = 42):
+        root = CACHE_DIR / f"k{k_imf or 'all'}" / subject
         tf = transforms.Compose([
-            transforms.Resize((656, 875)),  # 保持与论文一致
+            transforms.Resize((656, 875)),
             transforms.ToTensor(),
-            transforms.Normalize([0.5] * 3, [0.5] * 3)
+            transforms.Normalize([0.5]*3, [0.5]*3)
         ])
-        self.samples: List[Tuple[Path, int]] = []
-        for subj_dir in self.root.iterdir():
-            if not subj_dir.is_dir():  # ← 跳过 .DS_Store 等非目录
-                continue
-            for label_dir in subj_dir.iterdir():
-                if not label_dir.is_dir():  # ← 再次过滤
-                    continue
-                label = int(label_dir.name)
-                for img in label_dir.glob("*.png"):
-                    self.samples.append((img, label))
-        # 固定随机切分
+        self.samples: list[tuple[Path, int]] = []
+        for lbl_dir in root.iterdir():
+            if lbl_dir.is_dir():
+                lbl = int(lbl_dir.name)
+                self.samples += [(p, lbl) for p in lbl_dir.glob("*.png")]
         rng = np.random.default_rng(seed)
         rng.shuffle(self.samples)
-        split = int(len(self.samples)*(1-val_split))
-        self.samples = self.samples[:split] if train else self.samples[split:]
-        self.transform = tf
+        cut = int(len(self.samples)*split)
+        self.samples = self.samples[:cut] if train else self.samples[cut:]
+        self.tf = tf
 
-    def __len__(self):
-        return len(self.samples)
+    def __len__(self): return len(self.samples)
 
     def __getitem__(self, idx):
         p, y = self.samples[idx]
-        x = Image.open(p).convert('RGB')
-        x = self.transform(x)
+        x = self.tf(Image.open(p).convert("RGB"))
         return x, y
 
 # ---------------------------------------------------------------------------
@@ -311,69 +303,69 @@ class ConvNet(nn.Module):
 # 训练循环
 # ---------------------------------------------------------------------------
 
-def train_model(k_imf: int | None = None, batch_size: int = 32, epochs: int = 50,
-                lr: float = 1e-3, device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
-    train_ds = HilbertSpectrumDataset(k_imf=k_imf, train=True)
-    val_ds = HilbertSpectrumDataset(k_imf=k_imf, train=False)
-    # tl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4)
-    # vl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4)
-    tl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-    vl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+def train_subject_dependent(k_imf=None, batch_size=32, epochs=50, lr=1e-3,
+                            device='cuda' if torch.cuda.is_available() else 'cpu'):
+    macro_acc = []
+    for subj in SUBJECTS:
+        print(f"\n### Subject {subj} ###")
+        ds_tr = SubjDataset(subj, k_imf, train=True)
+        ds_va = SubjDataset(subj, k_imf, train=False)
+        dl_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True,  num_workers=0)
+        dl_va = DataLoader(ds_va, batch_size=batch_size, shuffle=False, num_workers=0)
 
-    model = ConvNet().to(device)
-    crit = nn.CrossEntropyLoss()
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+        model = ConvNet().to(device)
+        opt   = torch.optim.Adam(model.parameters(), lr=lr)
+        crit  = nn.CrossEntropyLoss()
+        best  = 0.
 
-    best_acc = 0.0
-    for ep in range(1, epochs+1):
-        model.train(); running = 0.0
-        for x, y in tl:
-            x, y = x.to(device), y.to(device)
-            opt.zero_grad(); out = model(x); loss = crit(out, y)
-            loss.backward(); opt.step()
-            running += loss.item()*x.size(0)
-        train_loss = running/len(train_ds)
+        for ep in range(1, epochs+1):
+            model.train(); running = 0.
+            for x,y in dl_tr:
+                x,y = x.to(device), y.to(device)
+                opt.zero_grad(); out = model(x); loss = crit(out,y)
+                loss.backward(); opt.step()
+                running += loss.item()*x.size(0)
+            tr_loss = running/len(ds_tr)
 
-        # 验证
-        model.eval(); correct = 0
-        with torch.no_grad():
-            for x, y in vl:
-                x, y = x.to(device), y.to(device)
-                pred = model(x).argmax(1)
-                correct += (pred==y).sum().item()
-        acc = correct/len(val_ds)
-        best_acc = max(best_acc, acc)
-        print(f"[Ep {ep:03d}] loss {train_loss:.4f}  val {acc*100:.2f}%  best {best_acc*100:.2f}%")
-
-    model_out = PROJECT_ROOT / f"cnn_k{k_imf or 'all'}.pt"
-    torch.save(model.state_dict(), model_out)
-    print(f"Model saved → {model_out}")
-
+            model.eval(); correct=0
+            with torch.no_grad():
+                for x,y in dl_va:
+                    pred = model(x.to(device)).argmax(1)
+                    correct += (pred.cpu()==y).sum().item()
+            acc = correct/len(ds_va); best = max(best, acc)
+            if ep==epochs:
+                print(f"  final val {acc*100:.2f}%  best {best*100:.2f}%")
+        macro_acc.append(best)
+    print(f"\n=== Macro-average accuracy {np.mean(macro_acc)*100:.2f}% ===")
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
+# ==== 3️⃣  CLI：加一个 --subj-dep 开关 =====================================
 def parse_args():
-    p = argparse.ArgumentParser("EEG‑HHT‑CNN pipeline")
-    p.add_argument('--make-cache', action='store_true', help='Generate Hilbert spectra')
-    p.add_argument('--train', action='store_true', help='Train CNN')
-    p.add_argument('--k', type=int, default=None, help='Top‑k IMFs (energy)')
+    p = argparse.ArgumentParser("EEG-HHT-CNN pipeline")
+    p.add_argument('--make-cache', action='store_true')
+    p.add_argument('--train', action='store_true')
+    p.add_argument('--subj-dep', action='store_true',
+                   help='subject-dependent training instead of mixed')
+    p.add_argument('--k', type=int, default=None)
     p.add_argument('--epochs', type=int, default=50)
     p.add_argument('--batch-size', type=int, default=32)
     p.add_argument('--lr', type=float, default=1e-3)
     return p.parse_args()
 
-
 def main():
     args = parse_args()
     if args.make_cache:
-        print("Generating Hilbert spectrum cache …")
         build_cache(k_imf=args.k, workers=max(mp.cpu_count()-1, 1))
     if args.train:
-        print("Training CNN …")
-        train_model(k_imf=args.k, batch_size=args.batch_size, epochs=args.epochs, lr=args.lr)
-    if not (args.make_cache or args.train):
-        print("Nothing to do – use --make-cache and/or --train. See --help")
+        if args.subj_dep:
+            train_subject_dependent(k_imf=args.k, batch_size=args.batch_size,
+                                    epochs=args.epochs, lr=args.lr)
+        else:
+            train_subject_dependent(k_imf=args.k, batch_size=args.batch_size,
+                        epochs=args.epochs, lr=args.lr)
+
 
 
 if __name__ == '__main__':
